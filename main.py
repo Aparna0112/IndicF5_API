@@ -17,6 +17,13 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import uvicorn
 
+# Add these new imports for environment variables and HF authentication
+from dotenv import load_dotenv
+from huggingface_hub import login
+
+# Load environment variables from .env file
+load_dotenv()
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -96,6 +103,22 @@ AUDIO_EXAMPLES = {
         "audio_data": None
     }
 }
+
+# Add this new function for HF authentication
+def authenticate_huggingface():
+    """Authenticate with Hugging Face using token from .env file"""
+    hf_token = os.getenv("HF_TOKEN")
+    if hf_token:
+        try:
+            login(token=hf_token)
+            logger.info("✅ Authenticated with Hugging Face using token from .env")
+            return True
+        except Exception as e:
+            logger.error(f"❌ HF Authentication failed: {str(e)}")
+            return False
+    else:
+        logger.error("❌ No HF_TOKEN found in .env file")
+        return False
 
 # Utility functions
 def get_device():
@@ -178,6 +201,12 @@ async def startup_event():
     global model, device
     
     try:
+        # Authenticate with Hugging Face first
+        auth_success = authenticate_huggingface()
+        if not auth_success:
+            logger.error("⚠️ HF authentication failed, model loading will likely fail")
+            return
+        
         # Get device
         device = get_device()
         
@@ -190,13 +219,14 @@ async def startup_event():
             
             repo_id = "ai4bharat/IndicF5"
             
-            # Load model with proper configuration
+            # Load model with proper configuration and authentication
             model = AutoModel.from_pretrained(
                 repo_id,
                 trust_remote_code=True,
                 torch_dtype=torch.float32,
                 device_map="auto" if torch.cuda.is_available() else None,
-                low_cpu_mem_usage=True
+                low_cpu_mem_usage=True,
+                use_auth_token=True  # This will use the logged-in token
             )
             
             if not torch.cuda.is_available():
@@ -216,7 +246,8 @@ async def startup_event():
                 model = AutoModel.from_pretrained(
                     "ai4bharat/IndicF5",
                     trust_remote_code=True,
-                    torch_dtype=torch.float32
+                    torch_dtype=torch.float32,
+                    use_auth_token=True  # Add authentication here too
                 )
                 
                 # Handle meta tensor issue
@@ -231,7 +262,7 @@ async def startup_event():
             except Exception as e2:
                 logger.error(f"Alternative method also failed: {str(e2)}")
                 logger.error("❌ Model loading failed completely")
-                logger.error("💡 Please install IndicF5 using: pip install git+https://github.com/ai4bharat/IndicF5.git")
+                logger.error("💡 Please ensure you have access to the IndicF5 model and valid HF_TOKEN in .env file")
                 model = None
         
         # Preload example audios
@@ -246,6 +277,7 @@ async def startup_event():
         logger.error(f"❌ Startup failed: {str(e)}")
         model = None
 
+# Rest of your existing code remains the same...
 @app.get("/")
 async def root():
     """API information and health check"""
@@ -320,7 +352,7 @@ async def synthesize_speech(
     if model is None:
         raise HTTPException(
             status_code=503, 
-            detail="Model not loaded. Please install IndicF5: pip install git+https://github.com/ai4bharat/IndicF5.git"
+            detail="Model not loaded. Please check HF_TOKEN in .env file and ensure access to IndicF5 model"
         )
     
     if language.lower() not in SUPPORTED_LANGUAGES:
@@ -428,7 +460,7 @@ async def synthesize_speech_audio(
     if model is None:
         raise HTTPException(
             status_code=503, 
-            detail="Model not loaded. Please install IndicF5: pip install git+https://github.com/ai4bharat/IndicF5.git"
+            detail="Model not loaded. Please check HF_TOKEN in .env file"
         )
     
     try:
@@ -502,7 +534,7 @@ async def synthesize_with_example(
     if model is None:
         raise HTTPException(
             status_code=503, 
-            detail="Model not loaded. Please install IndicF5: pip install git+https://github.com/ai4bharat/IndicF5.git"
+            detail="Model not loaded. Please check HF_TOKEN in .env file"
         )
     
     if example_id not in AUDIO_EXAMPLES:
