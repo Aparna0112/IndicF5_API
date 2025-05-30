@@ -28,14 +28,21 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-print("Starting IndicF5 TTS API server...")
-print("Starting server on port 8000")
+# RunPod specific logging
+logger.info("🚀 Starting IndicF5 TTS API server for RunPod deployment...")
+
+# RunPod port handling - check for RunPod's environment variables
+RUNPOD_PORT = os.getenv("RUNPOD_TCP_PORT_8000")
+DEFAULT_PORT = os.getenv("PORT", "8000")
+SERVER_PORT = int(RUNPOD_PORT or DEFAULT_PORT)
+
+logger.info(f"🌐 Server will start on port {SERVER_PORT}")
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="IndicF5 TTS Production API",
-    description="🎯 Production-ready Text-to-Speech API for Indian Languages using IndicF5",
-    version="2.0.0",
+    title="IndicF5 TTS Production API - RunPod",
+    description="🎯 Production-ready Text-to-Speech API for Indian Languages using IndicF5 on RunPod",
+    version="2.1.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -79,6 +86,7 @@ class HealthResponse(BaseModel):
     gpu_info: Optional[Dict[str, Any]] = None
     supported_languages: List[str]
     example_audios_loaded: int
+    runpod_info: Optional[Dict[str, Any]] = None
 
 # Configuration
 SUPPORTED_LANGUAGES = [
@@ -104,6 +112,18 @@ AUDIO_EXAMPLES = {
     }
 }
 
+def get_runpod_info():
+    """Get RunPod specific environment information"""
+    return {
+        "pod_id": os.getenv("RUNPOD_POD_ID"),
+        "public_ip": os.getenv("RUNPOD_PUBLIC_IP"),
+        "tcp_port": os.getenv("RUNPOD_TCP_PORT_8000"),
+        "gpu_count": os.getenv("RUNPOD_GPU_COUNT"),
+        "cpu_count": os.getenv("RUNPOD_CPU_COUNT"),
+        "memory_gb": os.getenv("RUNPOD_MEM_GB"),
+        "container_id": os.getenv("RUNPOD_CONTAINER_ID"),
+    }
+
 # Add this new function for HF authentication
 def authenticate_huggingface():
     """Authenticate with Hugging Face using token from .env file"""
@@ -111,13 +131,13 @@ def authenticate_huggingface():
     if hf_token:
         try:
             login(token=hf_token)
-            logger.info("✅ Authenticated with Hugging Face using token from .env")
+            logger.info("✅ Authenticated with Hugging Face using token from environment")
             return True
         except Exception as e:
             logger.error(f"❌ HF Authentication failed: {str(e)}")
             return False
     else:
-        logger.error("❌ No HF_TOKEN found in .env file")
+        logger.error("❌ No HF_TOKEN found in environment variables")
         return False
 
 # Utility functions
@@ -127,13 +147,13 @@ def get_device():
         device = torch.device("cuda")
         try:
             gpu_name = torch.cuda.get_device_name(0)
-            logger.info(f"Using GPU: {gpu_name}")
+            logger.info(f"🎮 Using GPU: {gpu_name}")
         except:
-            logger.info("Using GPU: CUDA device available")
+            logger.info("🎮 Using GPU: CUDA device available")
         return device
     else:
         device = torch.device("cpu")
-        logger.info("Using CPU")
+        logger.info("🖥️ Using CPU")
         return device
 
 def load_audio_from_url(url: str, timeout: int = 30):
@@ -168,7 +188,7 @@ def normalize_audio(audio):
 
 def preload_example_audios():
     """Preload example audios at startup"""
-    logger.info("Preloading example audios...")
+    logger.info("📂 Preloading example audios...")
     for key, example in AUDIO_EXAMPLES.items():
         try:
             sample_rate, audio_data = load_audio_from_url(example["url"])
@@ -183,6 +203,17 @@ def preload_example_audios():
                 logger.warning(f"❌ Failed to load {example['name']}")
         except Exception as e:
             logger.error(f"Error preloading {example['name']}: {str(e)}")
+
+def ensure_directories():
+    """Ensure necessary directories exist"""
+    dirs = [
+        os.getenv("MODEL_CACHE_DIR", "/app/model_cache"),
+        os.getenv("TEMP_DIR", "/app/temp"),
+        "/app/logs"
+    ]
+    for dir_path in dirs:
+        os.makedirs(dir_path, exist_ok=True)
+        logger.info(f"📁 Directory ensured: {dir_path}")
 
 # API Authentication (optional)
 def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -201,6 +232,15 @@ async def startup_event():
     global model, device
     
     try:
+        logger.info("🔧 Starting initialization process...")
+        
+        # Ensure directories exist
+        ensure_directories()
+        
+        # Log RunPod environment info
+        runpod_info = get_runpod_info()
+        logger.info(f"🏃 RunPod Environment: {runpod_info}")
+        
         # Authenticate with Hugging Face first
         auth_success = authenticate_huggingface()
         if not auth_success:
@@ -219,6 +259,9 @@ async def startup_event():
             
             repo_id = "ai4bharat/IndicF5"
             
+            # Create model cache directory
+            cache_dir = os.getenv("MODEL_CACHE_DIR", "/app/model_cache")
+            
             # Load model with proper configuration and authentication
             model = AutoModel.from_pretrained(
                 repo_id,
@@ -226,7 +269,8 @@ async def startup_event():
                 torch_dtype=torch.float32,
                 device_map="auto" if torch.cuda.is_available() else None,
                 low_cpu_mem_usage=True,
-                use_auth_token=True  # This will use the logged-in token
+                use_auth_token=True,  # This will use the logged-in token
+                cache_dir=cache_dir
             )
             
             if not torch.cuda.is_available():
@@ -247,7 +291,8 @@ async def startup_event():
                     "ai4bharat/IndicF5",
                     trust_remote_code=True,
                     torch_dtype=torch.float32,
-                    use_auth_token=True  # Add authentication here too
+                    use_auth_token=True,  # Add authentication here too
+                    cache_dir=cache_dir
                 )
                 
                 # Handle meta tensor issue
@@ -262,14 +307,14 @@ async def startup_event():
             except Exception as e2:
                 logger.error(f"Alternative method also failed: {str(e2)}")
                 logger.error("❌ Model loading failed completely")
-                logger.error("💡 Please ensure you have access to the IndicF5 model and valid HF_TOKEN in .env file")
+                logger.error("💡 Please ensure you have access to the IndicF5 model and valid HF_TOKEN in environment")
                 model = None
         
         # Preload example audios
         preload_example_audios()
         
         if model is not None:
-            logger.info("🎉 API is ready for production!")
+            logger.info("🎉 API is ready for production on RunPod!")
         else:
             logger.error("⚠️ API started but model is not loaded")
         
@@ -281,14 +326,16 @@ async def startup_event():
 @app.get("/")
 async def root():
     """API information and health check"""
+    runpod_info = get_runpod_info()
     return {
-        "message": "IndicF5 TTS Production API",
-        "version": "2.0.0",
+        "message": "IndicF5 TTS Production API - RunPod Deployment",
+        "version": "2.1.0",
         "status": "healthy" if model is not None else "unhealthy",
         "model_loaded": model is not None,
         "gpu_available": torch.cuda.is_available(),
         "supported_languages": SUPPORTED_LANGUAGES,
-        "installation_note": "If model is not loaded, install with: pip install git+https://github.com/ai4bharat/IndicF5.git",
+        "runpod_info": runpod_info,
+        "installation_note": "If model is not loaded, check HF_TOKEN and model access permissions",
         "endpoints": {
             "POST /synthesize": "Generate speech with uploaded reference audio",
             "POST /synthesize_with_example": "Generate speech using preloaded example audio",
@@ -320,7 +367,8 @@ async def health_check():
         gpu_available=torch.cuda.is_available(),
         gpu_info=gpu_info,
         supported_languages=SUPPORTED_LANGUAGES,
-        example_audios_loaded=len([k for k, v in AUDIO_EXAMPLES.items() if v["audio_data"] is not None])
+        example_audios_loaded=len([k for k, v in AUDIO_EXAMPLES.items() if v["audio_data"] is not None]),
+        runpod_info=get_runpod_info()
     )
 
 @app.get("/examples")
@@ -352,7 +400,7 @@ async def synthesize_speech(
     if model is None:
         raise HTTPException(
             status_code=503, 
-            detail="Model not loaded. Please check HF_TOKEN in .env file and ensure access to IndicF5 model"
+            detail="Model not loaded. Please check HF_TOKEN and ensure access to IndicF5 model"
         )
     
     if language.lower() not in SUPPORTED_LANGUAGES:
@@ -382,8 +430,9 @@ async def synthesize_speech(
         # Normalize audio
         audio_data = normalize_audio(audio_data)
         
-        # Save to temporary file
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
+        # Save to temporary file in designated temp directory
+        temp_dir = os.getenv("TEMP_DIR", "/app/temp")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=temp_dir) as temp_audio:
             sf.write(temp_audio.name, audio_data, samplerate=sample_rate, format='WAV')
             temp_audio_path = temp_audio.name
         
@@ -460,7 +509,7 @@ async def synthesize_speech_audio(
     if model is None:
         raise HTTPException(
             status_code=503, 
-            detail="Model not loaded. Please check HF_TOKEN in .env file"
+            detail="Model not loaded. Please check HF_TOKEN"
         )
     
     try:
@@ -475,7 +524,8 @@ async def synthesize_speech_audio(
         audio_data = normalize_audio(audio_data)
         
         # Save to temporary file
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
+        temp_dir = os.getenv("TEMP_DIR", "/app/temp")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=temp_dir) as temp_audio:
             sf.write(temp_audio.name, audio_data, samplerate=sample_rate, format='WAV')
             temp_audio_path = temp_audio.name
         
@@ -534,7 +584,7 @@ async def synthesize_with_example(
     if model is None:
         raise HTTPException(
             status_code=503, 
-            detail="Model not loaded. Please check HF_TOKEN in .env file"
+            detail="Model not loaded. Please check HF_TOKEN"
         )
     
     if example_id not in AUDIO_EXAMPLES:
@@ -559,7 +609,8 @@ async def synthesize_with_example(
         ref_text = example["ref_text"]
         
         # Save to temporary file
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
+        temp_dir = os.getenv("TEMP_DIR", "/app/temp")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=temp_dir) as temp_audio:
             sf.write(temp_audio.name, audio_data, samplerate=sample_rate, format='WAV')
             temp_audio_path = temp_audio.name
         
@@ -628,23 +679,22 @@ if __name__ == "__main__":
             port = s.getsockname()[1]
         return port
     
-    # Get port from environment or find a free one
-    port = int(os.getenv("PORT", 0))
-    if port == 0:
-        port = find_free_port()
+    # Use the SERVER_PORT we determined earlier
+    port = SERVER_PORT or find_free_port()
+    host = os.getenv("HOST", "0.0.0.0")
     
-    print(f"Starting server on port {port}")
-    print(f"API Documentation: http://localhost:{port}/docs")
-    print(f"Health Check: http://localhost:{port}/health")
+    logger.info(f"🌐 Starting server on {host}:{port}")
+    logger.info(f"📚 API Documentation: http://{host}:{port}/docs")
+    logger.info(f"🔍 Health Check: http://{host}:{port}/health")
     
-    # Production server configuration
+    # Production server configuration optimized for RunPod
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
+        host=host,
         port=port,
         workers=1,
         loop="asyncio",
-        log_level="info",
+        log_level=os.getenv("LOG_LEVEL", "info").lower(),
         access_log=True,
         reload=False
     )
