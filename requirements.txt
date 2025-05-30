@@ -1,12 +1,29 @@
-# Core FastAPI dependencies
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
-python-multipart>=0.0.6
-
-# PyTorch and ML dependencies
-torch>=2.0.0
+torch==2.1.1
+torchaudio==2.1.1
 transformers==4.50.3
-huggingface-hub>=0.17.0
+librosa==0.10.1
+soundfile==0.12.1
+numpy==1.24.3
+requests==2.31.0
+python-multipart>==0.0.6
+pydantic==2.5.0
+accelerate==0.25.0
+datasets==2.15.0
+tokenizers==0.15.0
+huggingface-hub==0.19.4
+scipy==1.11.4
+resampy==0.4.2
+numba==0.58.1
+llvmlite==0.41.1
+cffi==1.16.0
+pycparser==2.21
+wheel==0.42.0
+setuptools==69.0.0
+python-dotenv==1.0.0
+
+
 
 # Audio processing
 librosa>=0.10.0
