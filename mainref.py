@@ -40,9 +40,9 @@ logger.info(f"🌐 Server will start on port {SERVER_PORT}")
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="IndicF5 TTS Production API - KC Voice",
-    description="🎯 Production-ready Malayalam Text-to-Speech API using KC Voice on RunPod",
-    version="2.1.0",
+    title="IndicF5 TTS Production API - KC Voice Only",
+    description="🎯 Simple Malayalam Text-to-Speech API using KC Voice - No Reference Audio Required",
+    version="2.2.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -63,11 +63,10 @@ security = HTTPBearer(auto_error=False)
 model = None
 device = None
 
-# Pydantic models
+# Simplified Pydantic models - NO reference audio required
 class TTSRequest(BaseModel):
     text: str
     language: str = "malayalam"
-    output_format: str = "wav"
 
 class TTSResponse(BaseModel):
     success: bool
@@ -94,13 +93,14 @@ SUPPORTED_LANGUAGES = [
     "malayalam", "marathi", "odia", "punjabi", "tamil", "telugu"
 ]
 
-# KC Voice configuration (only voice used)
+# KC Voice configuration (only voice used) - FIXED REFERENCE
 KC_VOICE = {
     "name": "KC Voice",
     "url": "https://raw.githubusercontent.com/Aparna0112/voicerecording-_TTS/main/KC%20Voice.wav",
     "ref_text": "ഹലോ ഇത് അപരനെ അല്ലേ ഞാൻ ജഗദീപ് ആണ് വിളിക്കുന്നത് ഇപ്പോൾ ഫ്രീയാണോ സംസാരിക്കാമോ",
     "sample_rate": None,
-    "audio_data": None
+    "audio_data": None,
+    "temp_file_path": None  # Store the temp file path for reuse
 }
 
 def get_runpod_info():
@@ -115,7 +115,6 @@ def get_runpod_info():
         "container_id": os.getenv("RUNPOD_CONTAINER_ID"),
     }
 
-# Add this new function for HF authentication
 def authenticate_huggingface():
     """Authenticate with Hugging Face using token from .env file"""
     hf_token = os.getenv("HF_TOKEN")
@@ -131,7 +130,6 @@ def authenticate_huggingface():
         logger.error("❌ No HF_TOKEN found in environment variables")
         return False
 
-# Utility functions
 def get_device():
     """Get the best available device (GPU/CPU)"""
     if torch.cuda.is_available():
@@ -165,12 +163,6 @@ def load_audio_from_url(url: str, timeout: int = 30):
         logger.error(f"Error loading audio from URL {url}: {str(e)}")
         return None, None
 
-def resample_audio(audio, orig_sr, target_sr):
-    """Resample audio to target sample rate"""
-    if orig_sr != target_sr:
-        return librosa.resample(audio, orig_sr=orig_sr, target_sr=target_sr)
-    return audio
-
 def normalize_audio(audio):
     """Normalize audio to prevent clipping"""
     if np.max(np.abs(audio)) > 0:
@@ -178,7 +170,7 @@ def normalize_audio(audio):
     return audio
 
 def preload_kc_voice():
-    """Preload KC voice audio at startup"""
+    """Preload KC voice audio at startup and create permanent temp file"""
     logger.info("📂 Preloading KC voice audio...")
     try:
         sample_rate, audio_data = load_audio_from_url(KC_VOICE["url"])
@@ -187,8 +179,18 @@ def preload_kc_voice():
             audio_data = normalize_audio(audio_data)
             duration = len(audio_data) / sample_rate
             KC_VOICE["sample_rate"] = sample_rate
-            KC_VOICE["audio_data"] = audio_data.tolist() if hasattr(audio_data, 'tolist') else list(audio_data)
+            KC_VOICE["audio_data"] = audio_data
+            
+            # Create permanent temp file for the reference audio
+            temp_dir = os.getenv("TEMP_DIR", "/app/temp")
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            temp_file_path = os.path.join(temp_dir, "kc_voice_reference.wav")
+            sf.write(temp_file_path, audio_data, samplerate=sample_rate, format='WAV')
+            KC_VOICE["temp_file_path"] = temp_file_path
+            
             logger.info(f"✅ Loaded {KC_VOICE['name']} (SR: {sample_rate}, Length: {duration:.2f}s)")
+            logger.info(f"📁 KC Voice reference saved to: {temp_file_path}")
             return True
         else:
             logger.warning(f"❌ Failed to load {KC_VOICE['name']}")
@@ -238,7 +240,7 @@ async def startup_event():
         auth_success = authenticate_huggingface()
         if not auth_success:
             logger.error("⚠️ HF authentication failed, model loading will likely fail")
-            return
+            # Don't return here, continue trying to load model
         
         # Get device
         device = get_device()
@@ -247,22 +249,18 @@ async def startup_event():
         logger.info("🚀 Loading IndicF5 model...")
         
         try:
-            # Method 1: Try importing from the correct location
             from transformers import AutoModel
             
             repo_id = "ai4bharat/IndicF5"
-            
-            # Create model cache directory
             cache_dir = os.getenv("MODEL_CACHE_DIR", "/app/model_cache")
             
-            # Load model with proper configuration and authentication
+            # Load model with proper configuration
             model = AutoModel.from_pretrained(
                 repo_id,
                 trust_remote_code=True,
                 torch_dtype=torch.float32,
                 device_map="auto" if torch.cuda.is_available() else None,
                 low_cpu_mem_usage=True,
-                use_auth_token=True,  # This will use the logged-in token
                 cache_dir=cache_dir
             )
             
@@ -277,37 +275,29 @@ async def startup_event():
             logger.info("💡 Trying alternative loading method...")
             
             try:
-                # Alternative method without device_map
                 from transformers import AutoModel
                 
                 model = AutoModel.from_pretrained(
                     "ai4bharat/IndicF5",
                     trust_remote_code=True,
                     torch_dtype=torch.float32,
-                    use_auth_token=True,  # Add authentication here too
                     cache_dir=cache_dir
                 )
                 
-                # Handle meta tensor issue
-                if hasattr(model, 'is_meta') and model.is_meta:
-                    model = model.to_empty(device=device)
-                else:
-                    model = model.to(device)
-                    
+                model = model.to(device)
                 model.eval()
                 logger.info("✅ IndicF5 model loaded with alternative method!")
                 
             except Exception as e2:
                 logger.error(f"Alternative method also failed: {str(e2)}")
                 logger.error("❌ Model loading failed completely")
-                logger.error("💡 Please ensure you have access to the IndicF5 model and valid HF_TOKEN in environment")
                 model = None
         
-        # Preload KC voice
+        # Preload KC voice - CRITICAL for no-upload functionality
         voice_loaded = preload_kc_voice()
         
         if model is not None and voice_loaded:
-            logger.info("🎉 API is ready for production with KC Voice on RunPod!")
+            logger.info("🎉 API is ready for production with KC Voice - NO REFERENCE AUDIO UPLOAD NEEDED!")
         else:
             logger.error("⚠️ API started but model or voice is not loaded")
         
@@ -320,18 +310,18 @@ async def root():
     """API information and health check"""
     runpod_info = get_runpod_info()
     return {
-        "message": "IndicF5 TTS Production API - KC Voice Only",
-        "version": "2.1.0",
+        "message": "IndicF5 TTS Production API - KC Voice Only (No Reference Audio Upload Required)",
+        "version": "2.2.0",
         "status": "healthy" if model is not None else "unhealthy",
         "model_loaded": model is not None,
-        "voice": "KC Voice (Fixed)",
+        "voice": "KC Voice (Pre-loaded)",
         "gpu_available": torch.cuda.is_available(),
         "supported_languages": SUPPORTED_LANGUAGES,
         "runpod_info": runpod_info,
-        "installation_note": "If model is not loaded, check HF_TOKEN and model access permissions",
+        "usage": "Just send text - no audio upload needed!",
         "endpoints": {
-            "POST /synthesize": "Generate speech using KC voice (no reference audio needed)",
-            "POST /synthesize_audio": "Generate speech and return as audio file",
+            "POST /generate": "Generate speech using KC voice (text only)",
+            "POST /generate_audio": "Generate speech and return as audio file",
             "GET /voice_info": "Get KC voice information",
             "GET /health": "Detailed health check"
         }
@@ -372,28 +362,30 @@ async def get_voice_info():
             "ref_text": KC_VOICE["ref_text"],
             "available": KC_VOICE["audio_data"] is not None,
             "sample_rate": KC_VOICE.get("sample_rate"),
-            "duration": len(KC_VOICE["audio_data"]) / KC_VOICE["sample_rate"] if KC_VOICE["audio_data"] and KC_VOICE["sample_rate"] else None
+            "duration": len(KC_VOICE["audio_data"]) / KC_VOICE["sample_rate"] if KC_VOICE["audio_data"] is not None and KC_VOICE["sample_rate"] else None,
+            "temp_file_ready": KC_VOICE["temp_file_path"] is not None
         }
     }
 
-@app.post("/synthesize", response_model=TTSResponse)
-async def synthesize_speech(
+# MAIN ENDPOINT - NO REFERENCE AUDIO UPLOAD REQUIRED
+@app.post("/generate", response_model=TTSResponse)
+async def generate_speech(
     text: str = Form(..., description="Text to synthesize"),
     language: str = Form(default="malayalam", description="Target language"),
     api_key: Optional[str] = Depends(verify_api_key)
 ):
-    """Generate speech using KC voice (no reference audio selection needed)"""
+    """Generate speech using KC voice - NO REFERENCE AUDIO UPLOAD REQUIRED"""
     
     if model is None:
         raise HTTPException(
             status_code=503, 
-            detail="Model not loaded. Please check HF_TOKEN and ensure access to IndicF5 model"
+            detail="Model not loaded. Please check server logs."
         )
     
-    if KC_VOICE["audio_data"] is None:
+    if KC_VOICE["audio_data"] is None or KC_VOICE["temp_file_path"] is None:
         raise HTTPException(
             status_code=503,
-            detail="KC voice not loaded properly"
+            detail="KC voice not loaded properly. Please restart the server."
         )
     
     if language.lower() not in SUPPORTED_LANGUAGES:
@@ -405,63 +397,49 @@ async def synthesize_speech(
     try:
         start_time = time.time()
         
-        # Convert list back to numpy array
-        audio_data = np.array(KC_VOICE["audio_data"], dtype=np.float32)
-        sample_rate = KC_VOICE["sample_rate"]
+        # Use the pre-loaded KC voice reference file
+        temp_audio_path = KC_VOICE["temp_file_path"]
         ref_text = KC_VOICE["ref_text"]
         
-        # Save to temporary file
-        temp_dir = os.getenv("TEMP_DIR", "/app/temp")
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=temp_dir) as temp_audio:
-            sf.write(temp_audio.name, audio_data, samplerate=sample_rate, format='WAV')
-            temp_audio_path = temp_audio.name
+        # Generate speech
+        logger.info(f"🎯 Generating with KC Voice: {text[:50]}...")
+        inference_start = time.time()
         
-        try:
-            # Generate speech
-            logger.info(f"🎯 Generating with KC Voice: {text[:50]}...")
-            inference_start = time.time()
-            
-            with torch.no_grad():
-                generated_audio = model(
-                    text,
-                    ref_audio_path=temp_audio_path,
-                    ref_text=ref_text
-                )
-            
-            inference_time = time.time() - inference_start
-            
-            # Process audio
-            if isinstance(generated_audio, torch.Tensor):
-                generated_audio = generated_audio.cpu().numpy()
-                
-            if generated_audio.dtype == np.int16:
-                generated_audio = generated_audio.astype(np.float32) / 32768.0
-            elif generated_audio.dtype == np.int32:
-                generated_audio = generated_audio.astype(np.float32) / 2147483648.0
-            
-            generated_audio = normalize_audio(generated_audio)
-            
-            # Convert to base64
-            buffer = io.BytesIO()
-            sf.write(buffer, generated_audio, 24000, format='WAV')
-            audio_base64 = base64.b64encode(buffer.getvalue()).decode()
-            
-            return TTSResponse(
-                success=True,
-                message=f"✅ Speech generated using KC Voice for {language}!",
-                audio_base64=audio_base64,
-                sample_rate=24000,
-                inference_time=inference_time,
-                language=language,
-                voice="KC Voice"
+        with torch.no_grad():
+            generated_audio = model(
+                text,
+                ref_audio_path=temp_audio_path,
+                ref_text=ref_text
             )
+        
+        inference_time = time.time() - inference_start
+        
+        # Process audio
+        if isinstance(generated_audio, torch.Tensor):
+            generated_audio = generated_audio.cpu().numpy()
             
-        finally:
-            try:
-                os.unlink(temp_audio_path)
-            except:
-                pass
-                
+        if generated_audio.dtype == np.int16:
+            generated_audio = generated_audio.astype(np.float32) / 32768.0
+        elif generated_audio.dtype == np.int32:
+            generated_audio = generated_audio.astype(np.float32) / 2147483648.0
+        
+        generated_audio = normalize_audio(generated_audio)
+        
+        # Convert to base64
+        buffer = io.BytesIO()
+        sf.write(buffer, generated_audio, 24000, format='WAV')
+        audio_base64 = base64.b64encode(buffer.getvalue()).decode()
+        
+        return TTSResponse(
+            success=True,
+            message=f"✅ Speech generated using KC Voice for {language}!",
+            audio_base64=audio_base64,
+            sample_rate=24000,
+            inference_time=inference_time,
+            language=language,
+            voice="KC Voice"
+        )
+        
     except Exception as e:
         logger.error(f"❌ Error with KC Voice synthesis: {str(e)}")
         return TTSResponse(
@@ -472,77 +450,66 @@ async def synthesize_speech(
             voice="KC Voice"
         )
 
-@app.post("/synthesize_audio")
-async def synthesize_speech_audio(
+# AUDIO FILE ENDPOINT - NO REFERENCE AUDIO UPLOAD REQUIRED
+@app.post("/generate_audio")
+async def generate_speech_audio(
     text: str = Form(..., description="Text to synthesize"),
     language: str = Form(default="malayalam", description="Target language"),
     api_key: Optional[str] = Depends(verify_api_key)
 ):
-    """Generate speech using KC voice and return as audio file"""
+    """Generate speech using KC voice and return as audio file - NO REFERENCE AUDIO UPLOAD REQUIRED"""
     
     if model is None:
         raise HTTPException(
             status_code=503, 
-            detail="Model not loaded. Please check HF_TOKEN"
+            detail="Model not loaded. Please check server logs."
         )
     
-    if KC_VOICE["audio_data"] is None:
+    if KC_VOICE["audio_data"] is None or KC_VOICE["temp_file_path"] is None:
         raise HTTPException(
             status_code=503,
-            detail="KC voice not loaded properly"
+            detail="KC voice not loaded properly. Please restart the server."
         )
     
     try:
-        # Convert list back to numpy array
-        audio_data = np.array(KC_VOICE["audio_data"], dtype=np.float32)
-        sample_rate = KC_VOICE["sample_rate"]
+        # Use the pre-loaded KC voice reference file
+        temp_audio_path = KC_VOICE["temp_file_path"]
         ref_text = KC_VOICE["ref_text"]
         
-        # Save to temporary file
-        temp_dir = os.getenv("TEMP_DIR", "/app/temp")
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=temp_dir) as temp_audio:
-            sf.write(temp_audio.name, audio_data, samplerate=sample_rate, format='WAV')
-            temp_audio_path = temp_audio.name
+        # Generate speech
+        logger.info(f"🎯 Generating audio file with KC Voice: {text[:50]}...")
         
-        try:
-            # Generate speech
-            with torch.no_grad():
-                generated_audio = model(
-                    text,
-                    ref_audio_path=temp_audio_path,
-                    ref_text=ref_text
-                )
-            
-            # Process audio
-            if isinstance(generated_audio, torch.Tensor):
-                generated_audio = generated_audio.cpu().numpy()
-                
-            if generated_audio.dtype == np.int16:
-                generated_audio = generated_audio.astype(np.float32) / 32768.0
-            elif generated_audio.dtype == np.int32:
-                generated_audio = generated_audio.astype(np.float32) / 2147483648.0
-            
-            generated_audio = normalize_audio(generated_audio)
-            
-            # Return as audio file
-            buffer = io.BytesIO()
-            sf.write(buffer, generated_audio, 24000, format='WAV')
-            buffer.seek(0)
-            
-            return Response(
-                content=buffer.getvalue(),
-                media_type="audio/wav",
-                headers={
-                    "Content-Disposition": f"attachment; filename=kc_voice_{language}_{int(time.time())}.wav"
-                }
+        with torch.no_grad():
+            generated_audio = model(
+                text,
+                ref_audio_path=temp_audio_path,
+                ref_text=ref_text
             )
+        
+        # Process audio
+        if isinstance(generated_audio, torch.Tensor):
+            generated_audio = generated_audio.cpu().numpy()
             
-        finally:
-            try:
-                os.unlink(temp_audio_path)
-            except:
-                pass
-                
+        if generated_audio.dtype == np.int16:
+            generated_audio = generated_audio.astype(np.float32) / 32768.0
+        elif generated_audio.dtype == np.int32:
+            generated_audio = generated_audio.astype(np.float32) / 2147483648.0
+        
+        generated_audio = normalize_audio(generated_audio)
+        
+        # Return as audio file
+        buffer = io.BytesIO()
+        sf.write(buffer, generated_audio, 24000, format='WAV')
+        buffer.seek(0)
+        
+        return Response(
+            content=buffer.getvalue(),
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": f"attachment; filename=kc_voice_{language}_{int(time.time())}.wav"
+            }
+        )
+        
     except Exception as e:
         logger.error(f"❌ Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
@@ -565,6 +532,7 @@ if __name__ == "__main__":
     logger.info(f"🌐 Starting server on {host}:{port}")
     logger.info(f"📚 API Documentation: http://{host}:{port}/docs")
     logger.info(f"🔍 Health Check: http://{host}:{port}/health")
+    logger.info(f"🎤 KC Voice TTS: http://{host}:{port}/generate")
     
     # Production server configuration optimized for RunPod
     uvicorn.run(
